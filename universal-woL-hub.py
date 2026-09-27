@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from datetime import datetime
+import logging
 import os
 import platform
 import re
@@ -19,9 +20,17 @@ import uvicorn
 SERVER_PORT = 2222
 SERVER_HOST = "0.0.0.0"
 
+# --- LOGGING CONFIGURATION ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("UniversalWoLHub")
+
 # --- OPERATING SYSTEM DETECTION ---
 CURRENT_OS = platform.system()  # 'Windows' or 'Linux'
-print(f"[*] Detected Operating System: {CURRENT_OS}")
+logger.info(f"Detected Operating System: {CURRENT_OS}")
 
 app = FastAPI(title="Universal LAN Watchdog & Wake-on-LAN Hub")
 
@@ -113,7 +122,7 @@ def query_netbios_name(ip: str, timeout: float = 0.3) -> str | None:
     return None
 
 
-# 2B. SMB Protocol (TCP 445) - Specially for Windows 10/11 (TC-Server)
+# 2B. SMB Protocol (TCP 445) - Specially for Windows 10/11 (e.g. TC-Server)
 def query_smb_name(ip: str, timeout: float = 0.5) -> str | None:
     smb2_negotiate = (
         b"\x00\x00\x00\x68"
@@ -132,7 +141,6 @@ def query_smb_name(ip: str, timeout: float = 0.5) -> str | None:
             s.sendall(smb2_negotiate)
             resp = s.recv(1024)
 
-            # Look for machine name in response
             matches = re.findall(rb"([A-Za-z0-9_\-]{3,15})\x00", resp)
             for m in matches:
                 decoded = m.decode("ascii", errors="ignore")
@@ -344,27 +352,76 @@ def read_linux_arp_table():
                         ):
                             devices[mac] = ip
     except Exception as e:
-        print(f"[Linux ARP Error] {e}")
+        logger.error(f"[Linux ARP Error] {e}")
     return devices
 
 
-# --- 4. WAKE-ON-LAN ENGINE ---
-def send_wol_packet(mac: str, broadcast_ip: str, port: int = 9):
-    clean_mac = re.sub(r"[:\.-]", "", mac)
-    if len(clean_mac) != 12:
-        raise ValueError("Invalid MAC address! Must contain exactly 12 hex characters.")
+# --- 4. ROBUST WAKE-ON-LAN ENGINE ---
+def send_wake_on_lan(
+    mac_address: str,
+    broadcast_ip: str = "255.255.255.255",
+    port: int = 9,
+) -> bool:
+    """Sends a Wake-on-LAN Magic Packet via UDP broadcast.
 
-    magic_packet = bytes.fromhex("FF" * 6 + clean_mac * 16)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.sendto(magic_packet, (broadcast_ip, port))
+    Enforces broadcast targeting to ensure delivery even if the target is
+    absent from the router's ARP table.
+    """
+    try:
+        # 1. Clean and validate MAC address
+        clean_mac = re.sub(r"[:\.-]", "", mac_address).strip()
+        if len(clean_mac) != 12 or not all(
+            c in "0123456789abcdefABCDEF" for c in clean_mac
+        ):
+            raise ValueError(
+                f"Invalid MAC format '{mac_address}'! Must be 12 hex characters."
+            )
+
+        # 2. Validate Port (Standard WoL uses 9 or 7)
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Invalid Port '{port}'! Must be between 1-65535.")
+
+        # 3. Check broadcast IP target
+        if not broadcast_ip.endswith(".255") and broadcast_ip != "255.255.255.255":
+            logger.warning(
+                f"IP '{broadcast_ip}' does not appear to be a subnet broadcast. "
+                f"Consider using '{DEFAULT_BROADCAST}' for reliable wake-up."
+            )
+
+        # 4. Craft Magic Packet (6x 0xFF + 16x MAC)
+        magic_packet = bytes.fromhex("FF" * 6 + clean_mac * 16)
+
+        # 5. Send via UDP socket with broadcast enabled
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            logger.info(
+                f"Sending WoL packet to MAC: {mac_address} | Target: {broadcast_ip}:{port}"
+            )
+            sock.sendto(magic_packet, (broadcast_ip, port))
+
+        logger.info(" Magic Packet successfully dispatched to the network.")
+        return True
+
+    except socket.error as e:
+        logger.error(
+            f"❌ Socket error sending packet to {broadcast_ip}:{port} - {e}"
+        )
+        raise RuntimeError(f"Network socket error: {e}")
+    except ValueError as e:
+        logger.error(f"❌ Parameter validation error: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Unexpected error in WoL engine: {e}")
+        raise
 
 
 # --- 5. BACKGROUND WATCHDOG THREAD ---
 def watchdog_background_loop():
     global discovered_devices, SUBNET_PREFIX, DEFAULT_BROADCAST
     SUBNET_PREFIX, DEFAULT_BROADCAST = get_lan_network_info()
-    print(f"[Watchdog] Active on subnet {SUBNET_PREFIX}0/24 (Broadcast: {DEFAULT_BROADCAST})")
+    logger.info(
+        f"Watchdog active on subnet {SUBNET_PREFIX}0/24 (Broadcast: {DEFAULT_BROADCAST})"
+    )
 
     while True:
         try:
@@ -396,10 +453,12 @@ def watchdog_background_loop():
                             "online": True,
                             "last_seen": now_str,
                         }
-                        print(f"[Watchdog] 🟢 New Device: {ip} | {mac} | {name}")
+                        logger.info(f"🟢 New Device: {ip} | {mac} | {name}")
                     else:
                         if not discovered_devices[mac]["online"]:
-                            print(f"[Watchdog] 🟡 Back Online: {ip} | {mac} | {discovered_devices[mac]['name']}")
+                            logger.info(
+                                f"🟡 Back Online: {ip} | {mac} | {discovered_devices[mac]['name']}"
+                            )
                         discovered_devices[mac]["online"] = True
                         discovered_devices[mac]["ip"] = ip
                         discovered_devices[mac]["last_seen"] = now_str
@@ -408,10 +467,12 @@ def watchdog_background_loop():
                 for mac, info in discovered_devices.items():
                     if mac not in current_scan and info["online"]:
                         info["online"] = False
-                        print(f"[Watchdog] 🔴 Disconnected: {info['ip']} | {mac} | {info['name']}")
+                        logger.info(
+                            f"🔴 Disconnected: {info['ip']} | {mac} | {info['name']}"
+                        )
 
         except Exception as e:
-            print(f"[Watchdog Exception] {e}")
+            logger.error(f"[Watchdog Exception] {e}")
 
         time.sleep(10)
 
@@ -426,9 +487,17 @@ class WakeRequest(BaseModel):
 @app.post("/api/wake")
 async def api_wake(data: WakeRequest):
     try:
-        target_ip = DEFAULT_BROADCAST if data.ip == "255.255.255.255" else data.ip
-        send_wol_packet(data.mac, target_ip, data.port)
-        return {"success": True, "message": f"Magic Packet sent to {data.mac} via {target_ip}:{data.port}"}
+        # Use detected directed broadcast if default 255.255.255.255 is passed
+        target_ip = (
+            DEFAULT_BROADCAST if data.ip == "255.255.255.255" else data.ip
+        )
+        send_wake_on_lan(
+            mac_address=data.mac, broadcast_ip=target_ip, port=data.port
+        )
+        return {
+            "success": True,
+            "message": f"Magic Packet sent to {data.mac} via {target_ip}:{data.port}",
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -567,7 +636,7 @@ async def get_dashboard():
                         <input type="text" id="manual-ip" value="255.255.255.255" class="text-input">
                     </div>
                     <div class="form-group">
-                        <label>Port</label>
+                        <label>Port (Default 9 or 7)</label>
                         <input type="number" id="manual-port" value="9" class="text-input">
                     </div>
                 </div>
@@ -715,14 +784,15 @@ async def get_dashboard():
 
 # --- APPLICATION ENTRY POINT ---
 if __name__ == "__main__":
+    # Start the continuous watchdog in a background daemon thread
     watchdog_thread = threading.Thread(
         target=watchdog_background_loop, daemon=True
     )
     watchdog_thread.start()
 
-    print("\n" + "=" * 65)
-    print(
+    logger.info("=" * 65)
+    logger.info(
         f"🚀 LAN Watchdog & WoL Server started on: http://{SERVER_HOST}:{SERVER_PORT}"
     )
-    print("=" * 65 + "\n")
+    logger.info("=" * 65)
     uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
