@@ -22,25 +22,73 @@ SERVER_HOST = "0.0.0.0"
 CURRENT_OS = platform.system()  # 'Windows' or 'Linux'
 print(f"[*] Detected Operating System: {CURRENT_OS}")
 
-app = FastAPI(title="LAN Watchdog & Wake-on-LAN Hub")
+app = FastAPI(title="Universal LAN Watchdog & Wake-on-LAN Hub")
 
 # --- THREAD-SAFE IN-MEMORY STORAGE ---
 devices_lock = threading.Lock()
 discovered_devices = {}
+name_cache = {}  # MAC -> Hostname cache
 SUBNET_PREFIX = ""
 DEFAULT_BROADCAST = "255.255.255.255"
 
+# --- EMBEDDED OUI VENDOR DATABASE ---
+MAC_VENDORS = {
+    # Apple
+    "60:9B:B4": "Apple Device",
+    "C8:E7:D8": "Apple Device",
+    "F0:18:98": "Apple Device",
+    "AC:BC:32": "Apple Device",
+    "BC:D0:74": "Apple Device",
+    "70:EE:50": "Apple Device",
+    "9A:3B:EF": "Apple (Private MAC)",
+    # Raspberry Pi
+    "DC:A6:32": "Raspberry Pi",
+    "B8:27:EB": "Raspberry Pi",
+    "E4:5F:01": "Raspberry Pi",
+    "28:CD:C1": "Raspberry Pi",
+    "D8:3A:DD": "Raspberry Pi",
+    # Espressif (IoT smart plugs, sensors, ESP32/ESP8266)
+    "3C:3B:AD": "Espressif Smart Home",
+    "24:62:AB": "Espressif Smart Home",
+    "30:AE:A4": "Espressif Smart Home",
+    "84:F3:EB": "Espressif Smart Home",
+    "C4:4F:33": "Espressif Smart Home",
+    # Samsung
+    "88:49:2D": "Samsung Device",
+    "50:01:D9": "Samsung Smart TV",
+    "A4:77:33": "Samsung Device",
+    "BC:44:86": "Samsung Mobile",
+    # Networking / Routers (TP-Link, Xiaomi, Asus, Netgear)
+    "78:84:3C": "Router / Gateway",
+    "50:C7:BF": "TP-Link Smart Device",
+    "70:4F:57": "TP-Link Device",
+    "C0:06:C3": "Xiaomi Device",
+    "00:1F:C6": "ASUS Device",
+    # Intel / PC Components
+    "00:1E:67": "Intel PC",
+    "A4:4C:C8": "Intel PC",
+    "68:05:CA": "Intel PC",
+    "F8:63:3F": "Intel PC",
+    "C8:5B:76": "Intel PC",
+    # Gaming & Smart Media
+    "00:04:1F": "Sony PlayStation",
+    "F8:46:1C": "Sony PlayStation",
+    "00:1C:62": "LG Electronics",
+    "A8:23:FE": "LG Smart TV",
+    "44:65:0D": "Amazon Echo",
+    "68:54:5A": "Amazon FireTV",
+    "F4:F5:D8": "Google / Nest",
+    # Virtualization
+    "00:50:56": "VMware Virtual",
+    "00:15:5D": "Hyper-V Virtual",
+}
 
-# --- 1. NETWORK INTERFACE & IP RESOLUTION (TAILSCALE-AWARE) ---
+
+# --- 1. NETWORK INTERFACE RESOLUTION (TAILSCALE-AWARE) ---
 def get_lan_network_info():
-    """Detects the real physical LAN IPv4 address and subnet prefix.
-
-    Explicitly ignores Tailscale (100.64.0.0/10) and loopback addresses.
-    Returns: (subnet_prefix, directed_broadcast) e.g., ('192.168.0.', '192.168.0.255')
-    """
+    """Finds physical LAN IP, ignoring Tailscale (100.x.y.z) and loopbacks."""
     detected_ip = None
 
-    # Method 1: Outbound socket check (finds default routing IP)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -51,7 +99,6 @@ def get_lan_network_info():
     except Exception:
         pass
 
-    # Method 2: Linux / Raspberry Pi fallback (hostname -I)
     if not detected_ip and CURRENT_OS == "Linux":
         try:
             output = subprocess.check_output(
@@ -64,9 +111,8 @@ def get_lan_network_info():
         except Exception:
             pass
 
-    # Fallback to standard private subnet if detection fails
     if not detected_ip:
-        detected_ip = "192.168.1.100"
+        detected_ip = "192.168.0.4"
 
     parts = detected_ip.split(".")
     subnet_prefix = f"{parts[0]}.{parts[1]}.{parts[2]}."
@@ -74,8 +120,109 @@ def get_lan_network_info():
     return subnet_prefix, broadcast_ip
 
 
-# --- 2. OS-SPECIFIC ARP RESOLUTION ---
-# Windows: Native SendARP via iphlpapi.dll (No Npcap required)
+# --- 2. MULTI-PROTOCOL HOSTNAME RESOLVER ---
+def query_netbios_name(ip: str, timeout: float = 0.3) -> str | None:
+    """Queries Windows NetBIOS Name Service (UDP 137)."""
+    # NetBIOS status request packet for '*'
+    packet = (
+        b"\x82\x28\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00"
+        b"\x00\x21\x00\x01"
+    )
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(packet, (ip, 137))
+            data, _ = s.recvfrom(1024)
+            if len(data) > 56:
+                num_names = data[56]
+                if num_names > 0 and len(data) >= 57 + 18:
+                    raw_name = data[57 : 57 + 15]
+                    name = raw_name.decode("ascii", errors="ignore").strip()
+                    if name and all(c.isprintable() for c in name):
+                        return name
+    except Exception:
+        pass
+    return None
+
+
+def query_mdns_name(ip: str, timeout: float = 0.4) -> str | None:
+    """Queries mDNS / Bonjour (UDP 5353) via PTR reverse lookup for Apple/Linux/IoT."""
+    try:
+        parts = ip.split(".")
+        rev_ip = f"{parts[3]}.{parts[2]}.{parts[1]}.{parts[0]}.in-addr.arpa"
+
+        # Build DNS PTR packet
+        query = b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        for label in rev_ip.split("."):
+            query += bytes([len(label)]) + label.encode("ascii")
+        query += b"\x00\x00\x0c\x00\x01"  # Type PTR (12), Class IN (1)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(query, ("224.0.0.251", 5353))
+            data, _ = s.recvfrom(1024)
+
+            # Look for '.local' in response
+            if b".local" in data:
+                idx = data.find(b".local")
+                # Step backwards to find start of domain label
+                start = max(0, idx - 30)
+                sub = data[start:idx]
+                clean = re.sub(r"[^a-zA-Z0-9\-_]", " ", sub.decode("latin1"))
+                words = clean.strip().split()
+                if words:
+                    cand = words[-1]
+                    if len(cand) >= 2 and not cand.lower().startswith("arpa"):
+                        return cand
+    except Exception:
+        pass
+    return None
+
+
+def smart_resolve_hostname(ip: str, mac: str) -> str:
+    """Smart resolver hierarchy:
+
+    1. Cache -> 2. NetBIOS (Windows) -> 3. mDNS (Apple/IoT) -> 4. Reverse DNS -> 5. MAC Vendor -> 6. Fallback
+    """
+    if mac in name_cache:
+        return name_cache[mac]
+
+    # Layer 1: NetBIOS (Best for Windows PCs)
+    nb_name = query_netbios_name(ip)
+    if nb_name:
+        name_cache[mac] = nb_name
+        return nb_name
+
+    # Layer 2: mDNS / Bonjour (Apple, Linux, IoT)
+    mdns_name = query_mdns_name(ip)
+    if mdns_name:
+        name_cache[mac] = mdns_name
+        return mdns_name
+
+    # Layer 3: Standard DNS
+    try:
+        dns_name = socket.gethostbyaddr(ip)[0]
+        if dns_name and not dns_name.startswith("192.168."):
+            clean_dns = dns_name.split(".")[0]
+            name_cache[mac] = clean_dns
+            return clean_dns
+    except Exception:
+        pass
+
+    # Layer 4: MAC OUI Vendor lookup
+    mac_prefix = mac.upper()[:8]
+    if mac_prefix in MAC_VENDORS:
+        vendor_name = f"{MAC_VENDORS[mac_prefix]} (.{ip.split('.')[-1]})"
+        name_cache[mac] = vendor_name
+        return vendor_name
+
+    # Layer 5: Clean fallback
+    fallback = f"Device .{ip.split('.')[-1]}"
+    return fallback
+
+
+# --- 3. OS-SPECIFIC ARP RESOLUTION ---
 def get_mac_windows(ip_str: str) -> str | None:
     try:
         dest_ip = struct.unpack("<I", socket.inet_aton(ip_str))[0]
@@ -91,7 +238,6 @@ def get_mac_windows(ip_str: str) -> str | None:
     return None
 
 
-# Linux / Raspberry Pi: Ping sweep + /proc/net/arp (No sudo required)
 def ping_ip_linux(ip_str: str):
     try:
         subprocess.run(
@@ -114,7 +260,6 @@ def read_linux_arp_table():
                         ip = parts[0]
                         flags = parts[2]
                         mac = parts[3].upper()
-                        # Flag 0x2 indicates a resolved ARP entry
                         if (
                             flags == "0x2"
                             and mac != "00:00:00:00:00:00"
@@ -126,17 +271,8 @@ def read_linux_arp_table():
     return devices
 
 
-def resolve_hostname(ip: str) -> str:
-    """Performs reverse DNS lookup to get the device hostname."""
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return "Unknown Device"
-
-
-# --- 3. WAKE-ON-LAN ENGINE ---
+# --- 4. WAKE-ON-LAN ENGINE ---
 def send_wol_packet(mac: str, broadcast_ip: str, port: int = 9):
-    """Crafts and sends the magic packet over UDP broadcast."""
     clean_mac = re.sub(r"[:\.-]", "", mac)
     if len(clean_mac) != 12:
         raise ValueError("Invalid MAC address! Must contain exactly 12 hex characters.")
@@ -147,7 +283,7 @@ def send_wol_packet(mac: str, broadcast_ip: str, port: int = 9):
         s.sendto(magic_packet, (broadcast_ip, port))
 
 
-# --- 4. BACKGROUND WATCHDOG THREAD ---
+# --- 5. BACKGROUND WATCHDOG THREAD ---
 def watchdog_background_loop():
     global discovered_devices, SUBNET_PREFIX, DEFAULT_BROADCAST
     SUBNET_PREFIX, DEFAULT_BROADCAST = get_lan_network_info()
@@ -159,7 +295,6 @@ def watchdog_background_loop():
             current_scan = {}
             now_str = datetime.now().strftime("%H:%M:%S")
 
-            # Perform scan based on host OS
             if CURRENT_OS == "Windows":
                 with ThreadPoolExecutor(max_workers=60) as executor:
                     results = executor.map(
@@ -173,11 +308,10 @@ def watchdog_background_loop():
                     executor.map(ping_ip_linux, target_ips)
                 current_scan = read_linux_arp_table()
 
-            # Synchronize state in RAM
             with devices_lock:
                 for mac, ip in current_scan.items():
                     if mac not in discovered_devices:
-                        name = resolve_hostname(ip)
+                        name = smart_resolve_hostname(ip, mac)
                         discovered_devices[mac] = {
                             "mac": mac,
                             "ip": ip,
@@ -193,7 +327,7 @@ def watchdog_background_loop():
                         discovered_devices[mac]["ip"] = ip
                         discovered_devices[mac]["last_seen"] = now_str
 
-                # Detect disconnected/offline devices
+                # Detect offline devices
                 for mac, info in discovered_devices.items():
                     if mac not in current_scan and info["online"]:
                         info["online"] = False
@@ -202,10 +336,10 @@ def watchdog_background_loop():
         except Exception as e:
             print(f"[Watchdog Exception] {e}")
 
-        time.sleep(10)  # Polling interval
+        time.sleep(10)
 
 
-# --- 5. FASTAPI REST API ---
+# --- 6. FASTAPI REST API ---
 class WakeRequest(BaseModel):
     mac: str
     ip: str = "255.255.255.255"
@@ -215,7 +349,6 @@ class WakeRequest(BaseModel):
 @app.post("/api/wake")
 async def api_wake(data: WakeRequest):
     try:
-        # Default to detected directed broadcast if 255.255.255.255 is passed
         target_ip = DEFAULT_BROADCAST if data.ip == "255.255.255.255" else data.ip
         send_wol_packet(data.mac, target_ip, data.port)
         return {"success": True, "message": f"Magic Packet sent to {data.mac} via {target_ip}:{data.port}"}
@@ -236,7 +369,7 @@ async def api_get_devices():
         }
 
 
-# --- 6. FRONTEND DASHBOARD ---
+# --- 7. DASHBOARD HTML ---
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
     html_content = """
@@ -248,8 +381,7 @@ async def get_dashboard():
         <title>LAN Watchdog & WoL Hub</title>
         <style>
             body {
-                background-color: #030712;
-                color: #f3f4f6;
+                background-color: #030712; color: #f3f4f6;
                 font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                 margin: 0; padding: 0; display: flex; flex-direction: column; min-height: 100vh;
             }
@@ -321,7 +453,6 @@ async def get_dashboard():
 
             <div id="status-banner"></div>
 
-            <!-- DISCOVERED DEVICES -->
             <div class="card">
                 <div class="card-header">
                     <h2 style="font-size: 1.1rem; font-weight: bold; margin: 0;">Discovered Devices (Watchdog)</h2>
@@ -332,7 +463,6 @@ async def get_dashboard():
                 </div>
             </div>
 
-            <!-- FAVORITE DEVICES -->
             <div class="card">
                 <div class="card-header">
                     <h2 style="font-size: 1.1rem; font-weight: bold; margin: 0;">Favorite Devices</h2>
@@ -342,7 +472,6 @@ async def get_dashboard():
                 </div>
             </div>
 
-            <!-- MANUAL WAKE -->
             <div class="card">
                 <div class="card-header">
                     <h2 style="font-size: 1.1rem; font-weight: bold; margin: 0;">Manual Wake-on-LAN</h2>
@@ -380,7 +509,6 @@ async def get_dashboard():
                 setTimeout(() => { banner.style.display = 'none'; }, 4000);
             }
 
-            // LocalStorage Favorite Management
             function getSavedDevices() {
                 const data = localStorage.getItem('wol_fav_devices');
                 return data ? JSON.parse(data) : [];
@@ -429,7 +557,6 @@ async def get_dashboard():
                 });
             }
 
-            // API Communication
             async function triggerWake(mac, ip, port) {
                 try {
                     const res = await fetch('/api/wake', {
@@ -511,7 +638,6 @@ async def get_dashboard():
 
 # --- APPLICATION ENTRY POINT ---
 if __name__ == "__main__":
-    # Start the continuous watchdog in a background daemon thread
     watchdog_thread = threading.Thread(
         target=watchdog_background_loop, daemon=True
     )
