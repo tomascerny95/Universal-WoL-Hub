@@ -85,9 +85,9 @@ Description=Universal WoL Hub & LAN Watchdog
 After=network.target
 
 [Service]
-User=pi
-WorkingDirectory=/home/pi/Universal-WoL-Hub
-ExecStart=/usr/bin/python3 /home/pi/Universal-WoL-Hub/universal-woL-hub.py
+User=!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!USERNAME!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+WorkingDirectory=/home/!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!USERNAME!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!/Universal-WoL-Hub
+ExecStart=/usr/bin/python3 /home/!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!USERNAME!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!/Universal-WoL-Hub/universal-woL-hub.py
 Restart=always
 RestartSec=5
 
