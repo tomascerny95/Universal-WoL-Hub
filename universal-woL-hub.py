@@ -9,6 +9,7 @@ import struct
 import subprocess
 import threading
 import time
+import urllib.request
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -31,56 +32,24 @@ name_cache = {}  # MAC -> Hostname cache
 SUBNET_PREFIX = ""
 DEFAULT_BROADCAST = "255.255.255.255"
 
-# --- EMBEDDED OUI VENDOR DATABASE ---
+# --- ACCURATE MAC OUI VENDOR DATABASE ---
 MAC_VENDORS = {
-    # Apple
+    "C8:E7:D8": "Mercusys / TP-Link",
+    "78:84:3C": "Technicolor Gateway",
+    "90:98:77": "JVC (Vestel TV)",
+    "88:49:2D": "Samsung Device",
+    "50:01:D9": "Samsung Smart TV",
+    "3C:3B:AD": "Espressif Smart Home",
+    "24:62:AB": "Espressif Smart Home",
+    "10:C3:7B": "ASUSTek Computer",
     "60:9B:B4": "Apple Device",
-    "C8:E7:D8": "Apple Device",
-    "F0:18:98": "Apple Device",
-    "AC:BC:32": "Apple Device",
-    "BC:D0:74": "Apple Device",
-    "70:EE:50": "Apple Device",
-    "9A:3B:EF": "Apple (Private MAC)",
-    # Raspberry Pi
+    "9A:3B:EF": "Mobile (Private MAC)",
+    "5E:86:22": "Mobile (Private MAC)",
     "DC:A6:32": "Raspberry Pi",
     "B8:27:EB": "Raspberry Pi",
     "E4:5F:01": "Raspberry Pi",
-    "28:CD:C1": "Raspberry Pi",
-    "D8:3A:DD": "Raspberry Pi",
-    # Espressif (IoT smart plugs, sensors, ESP32/ESP8266)
-    "3C:3B:AD": "Espressif Smart Home",
-    "24:62:AB": "Espressif Smart Home",
-    "30:AE:A4": "Espressif Smart Home",
-    "84:F3:EB": "Espressif Smart Home",
-    "C4:4F:33": "Espressif Smart Home",
-    # Samsung
-    "88:49:2D": "Samsung Device",
-    "50:01:D9": "Samsung Smart TV",
-    "A4:77:33": "Samsung Device",
-    "BC:44:86": "Samsung Mobile",
-    # Networking / Routers (TP-Link, Xiaomi, Asus, Netgear)
-    "78:84:3C": "Router / Gateway",
-    "50:C7:BF": "TP-Link Smart Device",
-    "70:4F:57": "TP-Link Device",
-    "C0:06:C3": "Xiaomi Device",
-    "00:1F:C6": "ASUS Device",
-    # Intel / PC Components
-    "00:1E:67": "Intel PC",
-    "A4:4C:C8": "Intel PC",
-    "68:05:CA": "Intel PC",
-    "F8:63:3F": "Intel PC",
-    "C8:5B:76": "Intel PC",
-    # Gaming & Smart Media
     "00:04:1F": "Sony PlayStation",
-    "F8:46:1C": "Sony PlayStation",
     "00:1C:62": "LG Electronics",
-    "A8:23:FE": "LG Smart TV",
-    "44:65:0D": "Amazon Echo",
-    "68:54:5A": "Amazon FireTV",
-    "F4:F5:D8": "Google / Nest",
-    # Virtualization
-    "00:50:56": "VMware Virtual",
-    "00:15:5D": "Hyper-V Virtual",
 }
 
 
@@ -120,10 +89,11 @@ def get_lan_network_info():
     return subnet_prefix, broadcast_ip
 
 
-# --- 2. MULTI-PROTOCOL HOSTNAME RESOLVER ---
+# --- 2. MULTI-PROTOCOL HOSTNAME RESOLUTION ENGINE ---
+
+
+# 2A. NetBIOS (UDP 137) - Windows PC & Samba
 def query_netbios_name(ip: str, timeout: float = 0.3) -> str | None:
-    """Queries Windows NetBIOS Name Service (UDP 137)."""
-    # NetBIOS status request packet for '*'
     packet = (
         b"\x82\x28\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
         b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00"
@@ -134,90 +104,197 @@ def query_netbios_name(ip: str, timeout: float = 0.3) -> str | None:
             s.settimeout(timeout)
             s.sendto(packet, (ip, 137))
             data, _ = s.recvfrom(1024)
-            if len(data) > 56:
-                num_names = data[56]
-                if num_names > 0 and len(data) >= 57 + 18:
-                    raw_name = data[57 : 57 + 15]
-                    name = raw_name.decode("ascii", errors="ignore").strip()
-                    if name and all(c.isprintable() for c in name):
-                        return name
+            if len(data) > 56 and data[56] > 0 and len(data) >= 75:
+                name = data[57:72].decode("ascii", errors="ignore").strip()
+                if name and all(c.isprintable() for c in name):
+                    return name
     except Exception:
         pass
     return None
 
 
-def query_mdns_name(ip: str, timeout: float = 0.4) -> str | None:
-    """Queries mDNS / Bonjour (UDP 5353) via PTR reverse lookup for Apple/Linux/IoT."""
+# 2B. SMB Protocol (TCP 445) - Specially for Windows 10/11 (TC-Server)
+def query_smb_name(ip: str, timeout: float = 0.5) -> str | None:
+    smb2_negotiate = (
+        b"\x00\x00\x00\x68"
+        b"\xfeSMB"
+        b"\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x24\x00\x02\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x70\x00\x00\x00\x00\x00\x02\x02\x10\x02"
+    )
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((ip, 445))
+            s.sendall(smb2_negotiate)
+            resp = s.recv(1024)
+
+            # Look for machine name in response
+            matches = re.findall(rb"([A-Za-z0-9_\-]{3,15})\x00", resp)
+            for m in matches:
+                decoded = m.decode("ascii", errors="ignore")
+                if decoded not in [
+                    "SMB",
+                    "WORKGROUP",
+                    "NTLMSSP",
+                ] and any(c.isalpha() for c in decoded):
+                    return decoded
+    except Exception:
+        pass
+    return None
+
+
+# 2C. UPnP / SSDP (UDP 1900) - For Smart TVs (JVC TV, LG, Samsung)
+def query_upnp_ssdp(ip: str, timeout: float = 0.4) -> str | None:
+    msg = (
+        f"M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: 239.255.255.250:1900\r\n"
+        f'MAN: "ssdp:discover"\r\n'
+        f"MX: 1\r\n"
+        f"ST: upnp:rootdevice\r\n\r\n"
+    ).encode("utf-8")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(msg, (ip, 1900))
+            data, _ = s.recvfrom(2048)
+            text = data.decode("utf-8", errors="ignore")
+
+            match = re.search(
+                r"LOCATION:\s*(http://[^\r\n]+)", text, re.IGNORECASE
+            )
+            if match:
+                loc_url = match.group(1)
+                req = urllib.request.Request(
+                    loc_url, headers={"User-Agent": "UPnP/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    xml = resp.read(4096).decode("utf-8", errors="ignore")
+                    fn_match = re.search(
+                        r"<friendlyName>(.*?)</friendlyName>",
+                        xml,
+                        re.IGNORECASE,
+                    )
+                    if fn_match:
+                        return fn_match.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+# 2D. HTTP Title Grabber (Port 80/8080) - For Routers & Gateways
+def query_http_title(ip: str, timeout: float = 0.4) -> str | None:
+    for port in [80, 8080]:
+        try:
+            req = urllib.request.Request(
+                f"http://{ip}:{port}/",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                content = resp.read(2048).decode("utf-8", errors="ignore")
+                match = re.search(
+                    r"<title[^>]*>(.*?)</title>", content, re.IGNORECASE
+                )
+                if match:
+                    title = " ".join(match.group(1).strip().split())
+                    if len(title) > 2 and not any(
+                        err in title.lower()
+                        for err in ["404", "401", "403", "error", "not found"]
+                    ):
+                        return title[:32]
+        except Exception:
+            pass
+    return None
+
+
+# 2E. mDNS / Bonjour (UDP 5353) - For Apple & Linux
+def query_mdns_name(ip: str, timeout: float = 0.3) -> str | None:
     try:
         parts = ip.split(".")
         rev_ip = f"{parts[3]}.{parts[2]}.{parts[1]}.{parts[0]}.in-addr.arpa"
-
-        # Build DNS PTR packet
         query = b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
         for label in rev_ip.split("."):
             query += bytes([len(label)]) + label.encode("ascii")
-        query += b"\x00\x00\x0c\x00\x01"  # Type PTR (12), Class IN (1)
+        query += b"\x00\x00\x0c\x00\x01"
 
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.settimeout(timeout)
             s.sendto(query, ("224.0.0.251", 5353))
             data, _ = s.recvfrom(1024)
-
-            # Look for '.local' in response
             if b".local" in data:
                 idx = data.find(b".local")
-                # Step backwards to find start of domain label
-                start = max(0, idx - 30)
-                sub = data[start:idx]
+                sub = data[max(0, idx - 30) : idx]
                 clean = re.sub(r"[^a-zA-Z0-9\-_]", " ", sub.decode("latin1"))
                 words = clean.strip().split()
-                if words:
-                    cand = words[-1]
-                    if len(cand) >= 2 and not cand.lower().startswith("arpa"):
-                        return cand
+                if (
+                    words
+                    and len(words[-1]) >= 2
+                    and not words[-1].lower().startswith("arpa")
+                ):
+                    return words[-1]
     except Exception:
         pass
     return None
 
 
+# 2F. Main Smart Resolver Pipeline
 def smart_resolve_hostname(ip: str, mac: str) -> str:
-    """Smart resolver hierarchy:
-
-    1. Cache -> 2. NetBIOS (Windows) -> 3. mDNS (Apple/IoT) -> 4. Reverse DNS -> 5. MAC Vendor -> 6. Fallback
-    """
     if mac in name_cache:
         return name_cache[mac]
 
-    # Layer 1: NetBIOS (Best for Windows PCs)
-    nb_name = query_netbios_name(ip)
-    if nb_name:
-        name_cache[mac] = nb_name
-        return nb_name
+    # 1. NetBIOS (Windows PC - e.g. TC-COMP)
+    name = query_netbios_name(ip)
+    if name:
+        name_cache[mac] = name
+        return name
 
-    # Layer 2: mDNS / Bonjour (Apple, Linux, IoT)
-    mdns_name = query_mdns_name(ip)
-    if mdns_name:
-        name_cache[mac] = mdns_name
-        return mdns_name
+    # 2. SMB Port 445 (Windows 10/11 - e.g. TC-Server)
+    name = query_smb_name(ip)
+    if name:
+        name_cache[mac] = name
+        return name
 
-    # Layer 3: Standard DNS
+    # 3. UPnP / SSDP (Smart TVs - e.g. JVC TV)
+    name = query_upnp_ssdp(ip)
+    if name:
+        name_cache[mac] = name
+        return name
+
+    # 4. HTTP Web Title (Routers - e.g. Mercusys, Technicolor)
+    name = query_http_title(ip)
+    if name:
+        name_cache[mac] = name
+        return name
+
+    # 5. mDNS / Bonjour (Apple, Linux)
+    name = query_mdns_name(ip)
+    if name:
+        name_cache[mac] = name
+        return name
+
+    # 6. Reverse DNS
     try:
         dns_name = socket.gethostbyaddr(ip)[0]
         if dns_name and not dns_name.startswith("192.168."):
-            clean_dns = dns_name.split(".")[0]
-            name_cache[mac] = clean_dns
-            return clean_dns
+            clean = dns_name.split(".")[0]
+            name_cache[mac] = clean
+            return clean
     except Exception:
         pass
 
-    # Layer 4: MAC OUI Vendor lookup
-    mac_prefix = mac.upper()[:8]
-    if mac_prefix in MAC_VENDORS:
-        vendor_name = f"{MAC_VENDORS[mac_prefix]} (.{ip.split('.')[-1]})"
-        name_cache[mac] = vendor_name
-        return vendor_name
+    # 7. Accurate OUI Vendor Database
+    prefix = mac.upper()[:8]
+    if prefix in MAC_VENDORS:
+        v_name = f"{MAC_VENDORS[prefix]} (.{ip.split('.')[-1]})"
+        name_cache[mac] = v_name
+        return v_name
 
-    # Layer 5: Clean fallback
+    # 8. Clean Fallback
     fallback = f"Device .{ip.split('.')[-1]}"
     return fallback
 
